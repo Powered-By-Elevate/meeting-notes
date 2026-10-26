@@ -2,6 +2,8 @@
 // Claude (Enhance, Ask) and GitHub (sync into the Agentic OS repo) are the only outside calls,
 // and each needs a key Matt enters in Settings. Design notes: README.md.
 
+import { InkLayer, groups, render, bounds, PAPER, UNITS } from './ink.js';
+
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
@@ -37,7 +39,7 @@ const SAMPLE_RATE = 16000;
 const DEFAULTS = {
   anthropicKey: '', model: 'claude-sonnet-5-5', githubToken: '',
   repo: 'Powered-By-Elevate/agentic-os@notes-inbox', whisper: 'onnx-community/whisper-base.en',
-  liveCaptions: false, deleteAudio: false,
+  liveCaptions: false, deleteAudio: false, pencil: 'ink',
   // company and project names only by default: people's names go in on the iPad, in Settings
   vocab: 'True North, TNK12, Elevate, True Places, PAMG, GMW, Essentia, The Timberley, West Alley, Twenty3Twenty, Project i61, Riverbend, Libertas, Woodruff, Heartwood, proforma, rent roll, draw request, Sage Intacct, Procore, Velixo, Core BI',
 };
@@ -94,6 +96,7 @@ function newMeeting() {
     title: '', company: '', people: '', template: 'general',
     created: now, updated: now,
     lines: [],          // [{text, t}] t = ms into the recording when the line was first typed
+    ink: [],            // Pencil strokes, see ink.js: [{id, tool, color, w, t, at, end, pts}]
     durationMs: 0,      // total recorded so far, across every take
     chunks: 0,          // 22-second audio pieces saved
     transcript: [],     // [{t0, t1, text, seq}] from Whisper
@@ -168,9 +171,22 @@ function status(text, warn = false) {
 
 function touch(m) {
   m.updated = Date.now();
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => put('meetings', m).then(renderList), 400);
+  // a save at most 400 ms after the first change, so steady writing is saved as it goes
+  if (pending && pending !== m) flush();
+  pending = m;
+  saveTimer ||= setTimeout(flush, 400);
 }
+// the last edit is written at once when the app is hidden or closed, not lost with the timer
+let pending = null;
+function flush() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const m = pending;
+  pending = null;
+  if (m) put('meetings', m).then(renderList);
+}
+addEventListener('pagehide', flush);
+document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -218,7 +234,7 @@ function renderList() {
 // A meeting with nothing in it: no title, people, notes, audio or record. These are left behind
 // by opening the app or tapping + by mistake, and are never kept or synced.
 export function isEmpty(m) {
-  return !m.title.trim() && !m.people.trim() && !m.lines.some((l) => l.text.trim()) && !m.chunks && !m.enhanced && !m.qa.length;
+  return !m.title.trim() && !m.people.trim() && !m.lines.some((l) => l.text.trim()) && !m.ink?.length && !m.chunks && !m.enhanced && !m.qa.length;
 }
 
 async function forget(m, { remote = true } = {}) {
@@ -231,6 +247,7 @@ async function forget(m, { remote = true } = {}) {
       const [repo, branch = 'notes-inbox'] = settings.repo.split('@');
       const f = await gh(`/repos/${repo}/contents/${m.synced.path}?ref=${branch}`);
       if (f) await gh(`/repos/${repo}/contents/${m.synced.path}`, { method: 'DELETE', body: JSON.stringify({ message: `Notes: delete ${m.title || 'Untitled meeting'}`, sha: f.sha, branch }) });
+      if (m.synced.inkPath) await ghDelete(repo, branch, m.synced.inkPath, 'Notes: delete handwriting');
     } catch { /* offline or refused */ }
   }
 }
@@ -271,6 +288,12 @@ function fitSelect(sel) {
   sel.style.width = Math.ceil(ruler.measureText(text).width + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + 2) + 'px';
 }
 
+function fitPad() {
+  const p = $('#pad');
+  p.style.height = 'auto';
+  p.style.height = p.scrollHeight + 'px';
+}
+
 function open(m) {
   if (state.cur && state.cur !== m) dropIfEmpty(state.cur);
   state.cur = m;
@@ -285,6 +308,9 @@ function open(m) {
   fitSelect($('#template'));
   $('#people').value = m.people;
   $('#pad').value = m.lines.map((l) => l.text).join('\n');
+  m.ink ||= [];
+  fitPad();
+  ink.set(m.ink);
   $('#when').textContent = new Date(m.created).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
   state.view = 'pad';
   status('');
@@ -656,7 +682,9 @@ function renderPane() {
   if (!m) return;
   // the page shows your notes or Claude's, the drawer the transcript or Ask
   $$('.view').forEach((v) => { v.classList.toggle('on', v.dataset.view === state.view); v.classList.toggle('has', v.dataset.view === 'notes' && !!m.enhanced); });
-  $('#pad').hidden = state.view !== 'pad';
+  $('#write').hidden = state.view !== 'pad';
+  $('#tools').hidden = state.view !== 'pad';
+  if (state.view === 'pad') { fitPad(); ink.fit(); }
   $('#pane-notes').hidden = state.view !== 'notes';
   if (state.view === 'notes') renderNotes(m);
   $$('.tab').forEach((t) => t.classList.toggle('on', t.dataset.tab === state.tab));
@@ -671,6 +699,7 @@ function renderTimeline(m) {
   m.lines.forEach((l) => { if (l.text.trim()) items.push({ t: l.t, kind: 'mine', text: l.text }); });
   m.transcript.forEach((s) => items.push({ t: s.t0, kind: 'theirs', text: s.text }));
   m.captions.forEach((c) => items.push({ t: c.t, kind: 'live', text: c.text }));
+  groups(m.ink || []).forEach((g) => items.push({ t: g.t, kind: 'ink', img: inkThumb(g) }));
   // lines typed before the recording started have no time and come first
   items.sort((a, b) => (a.t ?? -1) - (b.t ?? -1));
   const pane = $('#pane-timeline');
@@ -679,7 +708,15 @@ function renderTimeline(m) {
     return;
   }
   const live = rec.interim && rec.meeting === m.id ? `<li><time>${clock(elapsed())}</time><span class="live">${esc(rec.interim)}</span></li>` : '';
-  pane.innerHTML = `<ul class="tl">${items.map((x) => `<li class="${x.t != null ? 'can' : ''}" data-t="${x.t ?? ''}"><time>${clock(x.t)}</time><span class="${x.kind}">${esc(x.text)}</span></li>`).join('')}${live}</ul>`;
+  pane.innerHTML = `<ul class="tl">${items.map((x) => `<li class="${x.t != null ? 'can' : ''}" data-t="${x.t ?? ''}"><time>${clock(x.t)}</time><span class="${x.kind}">${x.img ? `<img src="${x.img}" alt="Handwritten note">` : esc(x.text)}</span></li>`).join('')}${live}</ul>`;
+}
+
+// A handwritten note as a small picture for the transcript, drawn once per version of the note.
+const thumbs = new Map();
+function inkThumb(g) {
+  const key = `${g.id}:${g.strokes.length}:${matchMedia('(prefers-color-scheme: dark)').matches}`;
+  if (!thumbs.has(key)) thumbs.set(key, render(g.strokes, { scale: 1, pad: 6, maxPx: 900 }).toDataURL('image/png'));
+  return thumbs.get(key);
 }
 
 function renderNotes(m) {
@@ -822,10 +859,39 @@ TRANSCRIPT ([m:ss] from the start of the recording):
 ${transcriptText(m) || '(no recording)'}`;
 }
 
+// The Pencil notes go to Claude as pictures, one per handwritten note with the time it was
+// written, so Claude reads the handwriting itself. A page with a great many notes goes as
+// slices of the whole page instead.
+const png = (c) => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: c.toDataURL('image/png').split(',')[1] } });
+export function inkContent(m) {
+  const gs = groups(m.ink || []);
+  if (!gs.length) return [];
+  const out = [{ type: 'text', text: 'MY HANDWRITING: notes I wrote with the Apple Pencil, as pictures. They are part of MY NOTES: read them and treat their words exactly like typed notes, in [[double brackets]]. Write [?] for a word you cannot read.' }];
+  if (gs.length <= 24) {
+    for (const g of gs) {
+      out.push({ type: 'text', text: g.t != null ? `Written at [${clock(g.t)}]:` : 'Written before the recording started:' });
+      out.push(png(render(g.strokes, { scale: 1.3, bg: '#fff', css: PAPER, maxPx: 1568 })));
+    }
+  } else {
+    const all = m.ink.filter((x) => x.tool !== 'highlight');
+    const b = bounds(all);
+    for (let y = Math.max(0, b.y0); y < b.y1; y += 1200) {
+      out.push({ type: 'text', text: `The page, from ${Math.round(y)} down:` });
+      out.push(png(render(all, { box: { x0: 0, y0: y, x1: UNITS, y1: Math.min(b.y1, y + 1200) }, scale: 1.2, bg: '#fff', css: PAPER, maxPx: 1568 })));
+    }
+  }
+  return out;
+}
+function withInk(m, text, after = '') {
+  const ink = inkContent(m);
+  if (!ink.length) return text + after;
+  return [{ type: 'text', text }, ...ink, ...(after ? [{ type: 'text', text: after.trim() }] : [])];
+}
+
 async function enhance() {
   const m = state.cur;
   if (!m) return;
-  if (!m.lines.some((l) => l.text.trim()) && !m.transcript.length && !m.captions.length) { toast('Type some notes or record first.'); return; }
+  if (!m.lines.some((l) => l.text.trim()) && !m.ink?.length && !m.transcript.length && !m.captions.length) { toast('Write some notes or record first.'); return; }
   if (work.queue.some((j) => j.meeting === m.id) || work.busy?.meeting === m.id) toast('The transcript is still finishing. Enhancing with what is done so far.');
   state.view = 'notes';
   renderPane();
@@ -837,7 +903,7 @@ async function enhance() {
   live.className = 'md';
   pane.appendChild(live);
   try {
-    const out = await claude([{ role: 'user', content: meetingContext(m) }], {
+    const out = await claude([{ role: 'user', content: withInk(m, meetingContext(m)) }], {
       system: 'You write meeting records for Matt Knowles, a financial analyst at True North Companies. ' + NOTE_FORMAT,
       onText: (t) => { live.innerHTML = md(t); },
     });
@@ -870,7 +936,7 @@ async function ask() {
   renderPane();
   const last = $$('#pane-ask .qa .md').pop();
   try {
-    entry.a = await claude([{ role: 'user', content: context + '\n\nQUESTION: ' + q }], {
+    entry.a = await claude([{ role: 'user', content: all ? context + '\n\nQUESTION: ' + q : withInk(m, context, '\n\nQUESTION: ' + q) }], {
       system: 'Answer from the meeting material only. Quote exact words where they matter and give the [m:ss] time. If it is not in the material, say so. Be brief. Never use em dashes or semicolons.',
       maxTokens: 1500,
       onText: (t) => { if (last) last.innerHTML = md(t); },
@@ -909,6 +975,31 @@ export function slug(m) {
   return `${day}-${words || 'meeting'}-${m.id.slice(-6)}`;
 }
 
+async function ghDelete(repo, branch, path, message) {
+  const f = await gh(`/repos/${repo}/contents/${path}?ref=${branch}`);
+  if (f) await gh(`/repos/${repo}/contents/${path}`, { method: 'DELETE', body: JSON.stringify({ message, sha: f.sha, branch }) });
+}
+
+// The whole Pencil page as one picture beside the meeting's file, so the note in the OS shows it.
+async function syncInk(m, repo, branch, base) {
+  const path = base.replace(/\.json$/, '.ink.png');
+  const had = m.synced?.inkPath;
+  if (had && had !== path) await ghDelete(repo, branch, had, 'Notes: rename handwriting');
+  if (!m.ink?.length) {
+    if (had === path) await ghDelete(repo, branch, path, 'Notes: handwriting removed');
+    return {};
+  }
+  if (had === path && m.synced.inkAt >= (m.inkUpdated || 0)) return { inkPath: path, inkAt: m.synced.inkAt };
+  const b = bounds(m.ink);
+  const pic = render(m.ink, { box: { x0: 0, y0: 0, x1: UNITS, y1: Math.max(b.y1, 400) }, scale: 1.2, pad: 24, bg: '#fff', css: PAPER });
+  const existing = await gh(`/repos/${repo}/contents/${path}?ref=${branch}`);
+  await gh(`/repos/${repo}/contents/${path}`, {
+    method: 'PUT',
+    body: JSON.stringify({ message: `Notes: handwriting for ${m.title || 'Untitled meeting'}`, content: pic.toDataURL('image/png').split(',')[1], branch, ...(existing ? { sha: existing.sha } : {}) }),
+  });
+  return { inkPath: path, inkAt: Date.now() };
+}
+
 async function sync(m, quiet = true) {
   if (!settings.githubToken) { if (!quiet) toast('Add a GitHub token in Settings to sync.'); return; }
   const [repo, branch = 'notes-inbox'] = settings.repo.split('@');
@@ -923,15 +1014,16 @@ async function sync(m, quiet = true) {
     const old = await gh(`/repos/${repo}/contents/${m.synced.path}?ref=${branch}`);
     if (old) await gh(`/repos/${repo}/contents/${m.synced.path}`, { method: 'DELETE', body: JSON.stringify({ message: `Notes: rename ${m.synced.path}`, sha: old.sha, branch }) });
   }
+  const inkFile = await syncInk(m, repo, branch, path);
   const existing = await gh(`/repos/${repo}/contents/${path}?ref=${branch}`);
   const { _chunkEnd, ...doc } = m;
-  const body = JSON.stringify({ schema: 1, ...doc, companyName: COMPANIES.find((c) => c[0] === m.company)?.[1] || '' }, null, 2) + '\n';
+  const body = JSON.stringify({ schema: 1, ...doc, inkImage: inkFile.inkPath || null, companyName: COMPANIES.find((c) => c[0] === m.company)?.[1] || '' }, null, 2) + '\n';
   const at = Date.now();
   const r = await gh(`/repos/${repo}/contents/${path}`, {
     method: 'PUT',
     body: JSON.stringify({ message: `Notes: ${m.title || 'Untitled meeting'}`, content: b64(body), branch, ...(existing ? { sha: existing.sha } : {}) }),
   });
-  m.synced = { at, sha: r.content.sha, path };
+  m.synced = { at, sha: r.content.sha, path, ...inkFile };
   await put('meetings', m);
   renderList();
   if (!quiet) toast('Synced to ' + branch + '.');
@@ -954,6 +1046,67 @@ function fillSelects() {
   $('#template').innerHTML = Object.entries(TEMPLATES).map(([k, [n]]) => `<option value="${k}">${esc(n)}</option>`).join('');
 }
 
+// ---------------------------------------------------------------- the Pencil
+
+let ink = null;
+let penSeen = false;
+try { penSeen = localStorage.getItem('penSeen') === '1'; } catch { /* private mode */ }
+
+function paintTools() {
+  $$('.tool[data-tool]').forEach((b) => b.classList.toggle('sel', b.dataset.tool === ink.tool));
+  $('#tools').classList.toggle('armed', ink.armed);
+  $('#tools').classList.toggle('pen', penSeen && settings.pencil !== 'scribble');
+  $('#write').classList.toggle('armed', ink.armed);
+  $('#inkColor .swatch').className = 'swatch ' + ink.color;
+}
+
+function makeInk() {
+  ink = new InkLayer($('#write'), {
+    now: () => (state.cur && rec.meeting === state.cur.id ? elapsed() : null),
+    mode: () => settings.pencil,
+    onPen: () => {
+      // once a Pencil has written here, tools only change what it draws and a finger never draws
+      if (penSeen) return;
+      penSeen = true;
+      try { localStorage.setItem('penSeen', '1'); } catch { /* private mode */ }
+      ink.armed = false;
+      paintTools();
+    },
+    onChange: (strokes) => {
+      const m = state.cur;
+      if (!m) return;
+      m.ink = strokes;
+      m.inkUpdated = Date.now();
+      touch(m);
+      if (state.tab === 'timeline') renderTimeline(m);
+    },
+  });
+}
+
+function bindInk() {
+  $$('.tool[data-tool]').forEach((b) => {
+    b.onclick = () => {
+      const same = ink.tool === b.dataset.tool;
+      ink.tool = b.dataset.tool;
+      // without a Pencil, a tool lets a finger or the mouse draw, and tapping it again stops
+      if (!penSeen || settings.pencil === 'scribble') ink.armed = same ? !ink.armed : true;
+      paintTools();
+    };
+  });
+  $('#inkColor').onclick = () => {
+    const order = ['ink', 'blue', 'red'];
+    ink.color = order[(order.indexOf(ink.color) + 1) % order.length];
+    if (ink.tool !== 'pen') ink.tool = 'pen';
+    paintTools();
+  };
+  $('#inkUndo').onclick = () => { if (!ink.undo()) toast('Nothing to undo.'); };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && ink.armed) { ink.armed = false; paintTools(); } });
+  addEventListener('resize', () => { if (state.cur) fitPad(); });
+  // the handwriting pictures in the transcript are drawn in the theme's ink
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (state.cur) renderPane(); });
+  paintTools();
+}
+
 function bind() {
   $('#newBtn').onclick = create;
   $('#emptyNew').onclick = create;
@@ -973,6 +1126,7 @@ function bind() {
   $('#company').onchange = (e) => { state.cur.company = e.target.value; touch(state.cur); fitSelect(e.target); };
   $('#template').onchange = (e) => { state.cur.template = e.target.value; touch(state.cur); fitSelect(e.target); };
   $('#pad').oninput = (e) => {
+    fitPad();
     const m = state.cur;
     m.lines = restamp(m.lines, e.target.value, rec.meeting === m.id ? elapsed() : null);
     touch(m);
@@ -984,6 +1138,7 @@ function bind() {
     $('#pad').focus();
   };
   $$('.tab').forEach((t) => { t.onclick = () => { state.tab = t.dataset.tab; renderPane(); }; });
+  bindInk();
   $$('.view').forEach((v) => { v.onclick = () => { state.view = v.dataset.view; renderPane(); if (state.view === 'pad') $('#pad').focus(); }; });
   const drawer = (open) => {
     $('#stage').classList.toggle('closed', !open);
@@ -1050,6 +1205,7 @@ function bind() {
 
 async function boot() {
   fillSelects();
+  makeInk();
   bind();
   state.meetings = await getAll('meetings');
   // a recording cut off by a crash or a closed tab: its pieces are saved, the clock is not
@@ -1065,7 +1221,7 @@ async function boot() {
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   syncAll();
-  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance, isEmpty, removeCurrent, render: () => { renderList(); renderPane(); }, open };
+  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance, isEmpty, removeCurrent, render: () => { renderList(); renderPane(); }, open, ink: () => ink, groups, inkContent };
 }
 
 boot();
