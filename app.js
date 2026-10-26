@@ -151,10 +151,17 @@ export function notesText(m) {
 const state = { meetings: [], cur: null, tab: 'timeline', view: 'pad', query: '' };
 let saveTimer = null;
 
-function toast(msg, ms = 2600) {
+function toast(msg, ms = 2600, action = null) {
+  $$('.toast').forEach((x) => x.remove());
   const t = document.createElement('div');
   t.className = 'toast';
   t.textContent = msg;
+  if (action) {
+    const b = document.createElement('button');
+    b.textContent = action.label;
+    b.onclick = () => { t.remove(); action.fn(); };
+    t.appendChild(b);
+  }
   document.body.appendChild(t);
   setTimeout(() => t.remove(), ms);
 }
@@ -264,14 +271,93 @@ function showEmpty() {
 }
 
 async function removeCurrent() {
-  const m = state.cur;
+  if (state.cur) deleteMeeting(state.cur);
+}
+
+// A deleted meeting leaves the list at once and is gone for good five seconds later, unless Undo
+// is tapped: its notes, transcript, audio and synced copy all go then.
+const UNDO_MS = 5000;
+async function deleteMeeting(m) {
+  if (rec.meeting === m.id) { toast('Stop the recording before deleting this meeting.'); return; }
+  const wasOpen = state.cur === m;
+  state.meetings = state.meetings.filter((x) => x !== m);
+  if (wasOpen) showEmpty(); else renderList();
+  if (isEmpty(m)) { await forget(m, { remote: false }); return; }
+  let undone = false;
+  toast(`Deleted “${m.title || 'Untitled meeting'}”.`, UNDO_MS, {
+    label: 'Undo',
+    fn: () => {
+      undone = true;
+      state.meetings.push(m);
+      if (wasOpen) open(m); else renderList();
+    },
+  });
+  setTimeout(() => {
+    if (undone) return;
+    work.queue = work.queue.filter((j) => j.meeting !== m.id);
+    forget(m).catch(() => {});
+  }, UNDO_MS);
+}
+
+// Long press a meeting in the list (or right-click with a mouse) for its menu.
+let menuFor = null;
+function showMenu(item) {
+  const m = state.meetings.find((x) => x.id === item.dataset.id);
   if (!m) return;
-  if (!isEmpty(m) && !confirm(`Delete "${m.title || 'Untitled meeting'}"? Its notes, transcript, audio and synced copy all go.`)) return;
-  if (rec.meeting === m.id) await stopRecording();
-  work.queue = work.queue.filter((j) => j.meeting !== m.id);
-  await forget(m);
-  showEmpty();
-  toast('Meeting deleted.');
+  menuFor = m;
+  const menu = $('#itemMenu');
+  $('#menuTitle').textContent = m.title || 'Untitled meeting';
+  menu.hidden = false;
+  const r = item.getBoundingClientRect();
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(r.left + 12, innerWidth - w - 8)) + 'px';
+  menu.style.top = (r.bottom + 4 + h < innerHeight ? r.bottom + 4 : Math.max(8, r.top - h - 4)) + 'px';
+}
+function hideMenu() {
+  $('#itemMenu').hidden = true;
+  menuFor = null;
+}
+function bindListPress() {
+  const list = $('#list');
+  let press = null, swallow = false;
+  const cancel = () => {
+    if (!press) return;
+    clearTimeout(press.timer);
+    press.item.classList.remove('pressing');
+    press = null;
+  };
+  list.addEventListener('pointerdown', (e) => {
+    const item = e.target.closest('.item');
+    if (!item || e.button > 0) return;
+    cancel();
+    swallow = false;
+    item.classList.add('pressing');
+    press = {
+      item, x: e.clientX, y: e.clientY,
+      timer: setTimeout(() => {
+        swallow = true;
+        item.classList.remove('pressing');
+        press = null;
+        navigator.vibrate?.(8);
+        showMenu(item);
+      }, 500),
+    };
+  });
+  list.addEventListener('pointermove', (e) => { if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 10) cancel(); });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((t) => list.addEventListener(t, cancel));
+  list.addEventListener('scroll', cancel, { passive: true });
+  list.addEventListener('contextmenu', (e) => {
+    const item = e.target.closest('.item');
+    if (!item) return;
+    e.preventDefault();
+    cancel();
+    showMenu(item);
+  });
+  // the tap that ends a long press does not also open the meeting
+  list.addEventListener('click', (e) => { if (swallow) { swallow = false; e.stopImmediatePropagation(); } }, true);
+  $('#menuDelete').onclick = () => { const m = menuFor; hideMenu(); if (m) deleteMeeting(m); };
+  document.addEventListener('pointerdown', (e) => { if (menuFor && !e.target.closest('#itemMenu')) hideMenu(); }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && menuFor) hideMenu(); });
 }
 
 // The title wraps instead of running off the page, and each select is as wide as its words.
@@ -964,6 +1050,7 @@ async function gh(path, init = {}) {
     headers: { authorization: 'Bearer ' + settings.githubToken, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28', ...(init.headers || {}) },
   });
   if (res.status === 404 && (!init.method || init.method === 'GET')) return null;
+  if (res.status === 401) throw new Error(`GitHub did not accept the token in Settings (${settings.githubToken.length} characters, a full one is 93). Paste it again and tap Check GitHub.`);
   if (!res.ok) throw new Error('GitHub said ' + res.status + ': ' + ((await res.json().catch(() => ({}))).message || ''));
   return res.json();
 }
@@ -1107,12 +1194,48 @@ function bindInk() {
   paintTools();
 }
 
+// ---------------------------------------------------------------- keys
+
+const SECRETS = ['anthropicKey', 'githubToken'];
+
+// Under each key: how long it is and how it starts, so a key cut short when pasted shows.
+function keyInfo() {
+  const f = $('#settingsForm');
+  for (const el of $$('.keyinfo', f)) {
+    const k = el.dataset.key, v = f.elements[k].value.replace(/\s+/g, '');
+    let bad = '';
+    if (k === 'githubToken' && v.startsWith('github_pat_') && v.length !== 93) bad = ` A full token is 93, so this one was cut short or has extra characters.`;
+    if (k === 'githubToken' && v && !/^(github_pat_|ghp_)/.test(v)) bad = ' A GitHub token starts with github_pat_.';
+    if (k === 'anthropicKey' && v && !v.startsWith('sk-ant-')) bad = ' An Anthropic key starts with sk-ant-.';
+    el.textContent = v ? `${v.length} characters, starts ${v.slice(0, 15)}…${bad}` : '';
+    el.classList.toggle('bad', !!bad);
+  }
+}
+
+export async function checkGitHub(token, repoSpec) {
+  if (!token) return [false, 'Paste a token first.'];
+  const [repo] = repoSpec.split('@');
+  const call = (p) => fetch('https://api.github.com' + p, { headers: { authorization: 'Bearer ' + token, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' } });
+  try {
+    let r = await call('/user');
+    if (r.status === 401) return [false, `GitHub does not recognise this token (${token.length} characters). Copy it again from GitHub and paste it here.`];
+    if (!r.ok) return [false, `GitHub said ${r.status}.`];
+    const who = (await r.json()).login;
+    r = await call(`/repos/${repo}`);
+    if (!r.ok) return [false, `Signed in as ${who}, but this token cannot see ${repo}.`];
+    return [true, `Works. Signed in as ${who}, and it can reach ${repo}.`];
+  } catch {
+    return [false, 'Could not reach GitHub. Check the connection.'];
+  }
+}
+
 function bind() {
   $('#newBtn').onclick = create;
   $('#emptyNew').onclick = create;
   $('#listBtn').onclick = () => $('#app').classList.toggle('list-open');
   $('#delBtn').onclick = removeCurrent;
   $('#search').oninput = (e) => { state.query = e.target.value; renderList(); };
+  bindListPress();
   $('#list').onclick = (e) => {
     const b = e.target.closest('.item');
     if (b) open(state.meetings.find((m) => m.id === b.dataset.id));
@@ -1172,14 +1295,25 @@ function bind() {
       if (!el) continue;
       if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
     }
+    keyInfo();
+    $('#ghCheckOut').textContent = '';
     $('#settings').showModal();
+  };
+  $$('#settingsForm .secret').forEach((el) => { el.oninput = keyInfo; });
+  $('#ghCheck').onclick = async () => {
+    const f = $('#settingsForm'), out = $('#ghCheckOut');
+    out.className = '';
+    out.textContent = 'Checking…';
+    const [ok, msg] = await checkGitHub(f.elements.githubToken.value.replace(/\s+/g, ''), f.elements.repo.value.trim());
+    out.className = ok ? 'good' : 'bad';
+    out.textContent = msg;
   };
   $('#settings').onclose = () => {
     if ($('#settings').returnValue !== 'save') return;
     const f = $('#settingsForm'), s = {};
     for (const k of Object.keys(DEFAULTS)) {
       const el = f.elements[k];
-      if (el) s[k] = el.type === 'checkbox' ? el.checked : el.value.trim();
+      if (el) s[k] = el.type === 'checkbox' ? el.checked : SECRETS.includes(k) ? el.value.replace(/\s+/g, '') : el.value.trim();
     }
     saveSettings(s);
     renderList();
