@@ -189,7 +189,7 @@ function sse(text) {
   await page.waitForSelector('#meeting:not([hidden])');
 
   // portrait and dark
-  await page.click('.tab[data-tab="notes"]');
+  await page.click('.view[data-view="notes"]');
   await page.setViewportSize({ width: 820, height: 1180 });
   await page.screenshot({ path: path.join(OUT, '05-portrait.png') });
   await page.emulateMedia({ colorScheme: 'dark' });
