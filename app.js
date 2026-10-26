@@ -145,7 +145,7 @@ export function notesText(m) {
 
 // ---------------------------------------------------------------- state and UI helpers
 
-const state = { meetings: [], cur: null, tab: 'timeline', query: '' };
+const state = { meetings: [], cur: null, tab: 'timeline', view: 'pad', query: '' };
 let saveTimer = null;
 
 function toast(msg, ms = 2600) {
@@ -257,6 +257,20 @@ async function removeCurrent() {
   toast('Meeting deleted.');
 }
 
+// The title wraps instead of running off the page, and each select is as wide as its words.
+function fitTitle() {
+  const t = $('#title');
+  t.style.height = 'auto';
+  t.style.height = t.scrollHeight + 'px';
+}
+const ruler = document.createElement('canvas').getContext('2d');
+function fitSelect(sel) {
+  const cs = getComputedStyle(sel);
+  ruler.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const text = sel.options[sel.selectedIndex]?.text || '';
+  sel.style.width = Math.ceil(ruler.measureText(text).width + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + 2) + 'px';
+}
+
 function open(m) {
   if (state.cur && state.cur !== m) dropIfEmpty(state.cur);
   state.cur = m;
@@ -266,8 +280,13 @@ function open(m) {
   $('#title').value = m.title;
   $('#company').value = m.company;
   $('#template').value = m.template;
+  fitTitle();
+  fitSelect($('#company'));
+  fitSelect($('#template'));
   $('#people').value = m.people;
   $('#pad').value = m.lines.map((l) => l.text).join('\n');
+  $('#when').textContent = new Date(m.created).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  state.view = 'pad';
   status('');
   renderRec();
   renderList();
@@ -635,10 +654,14 @@ function wav(pcm) {
 function renderPane() {
   const m = state.cur;
   if (!m) return;
+  // the page shows your notes or Claude's, the drawer the transcript or Ask
+  $$('.view').forEach((v) => { v.classList.toggle('on', v.dataset.view === state.view); v.classList.toggle('has', v.dataset.view === 'notes' && !!m.enhanced); });
+  $('#pad').hidden = state.view !== 'pad';
+  $('#pane-notes').hidden = state.view !== 'notes';
+  if (state.view === 'notes') renderNotes(m);
   $$('.tab').forEach((t) => t.classList.toggle('on', t.dataset.tab === state.tab));
-  ['timeline', 'notes', 'ask'].forEach((t) => { $('#pane-' + t).hidden = t !== state.tab; });
+  ['timeline', 'ask'].forEach((t) => { $('#pane-' + t).hidden = t !== state.tab; });
   if (state.tab === 'timeline') renderTimeline(m);
-  if (state.tab === 'notes') renderNotes(m);
   if (state.tab === 'ask') renderAsk(m);
 }
 
@@ -804,7 +827,7 @@ async function enhance() {
   if (!m) return;
   if (!m.lines.some((l) => l.text.trim()) && !m.transcript.length && !m.captions.length) { toast('Type some notes or record first.'); return; }
   if (work.queue.some((j) => j.meeting === m.id) || work.busy?.meeting === m.id) toast('The transcript is still finishing. Enhancing with what is done so far.');
-  state.tab = 'notes';
+  state.view = 'notes';
   renderPane();
   const btn = $('#enhanceBtn');
   btn.disabled = true;
@@ -941,10 +964,14 @@ function bind() {
     const b = e.target.closest('.item');
     if (b) open(state.meetings.find((m) => m.id === b.dataset.id));
   };
-  $('#title').oninput = (e) => { state.cur.title = e.target.value; touch(state.cur); };
+  $('#title').oninput = (e) => { state.cur.title = e.target.value.replace(/\n/g, ' '); touch(state.cur); fitTitle(); };
+  // Return in the title moves on to the notes, as it would in a one-line field
+  $('#title').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#pad').focus(); } };
+  addEventListener('resize', () => { if (state.cur) fitTitle(); });
+  document.fonts?.ready.then(() => { if (state.cur) { fitTitle(); fitSelect($('#company')); fitSelect($('#template')); } });
   $('#people').oninput = (e) => { state.cur.people = e.target.value; touch(state.cur); };
-  $('#company').onchange = (e) => { state.cur.company = e.target.value; touch(state.cur); };
-  $('#template').onchange = (e) => { state.cur.template = e.target.value; touch(state.cur); };
+  $('#company').onchange = (e) => { state.cur.company = e.target.value; touch(state.cur); fitSelect(e.target); };
+  $('#template').onchange = (e) => { state.cur.template = e.target.value; touch(state.cur); fitSelect(e.target); };
   $('#pad').oninput = (e) => {
     const m = state.cur;
     m.lines = restamp(m.lines, e.target.value, rec.meeting === m.id ? elapsed() : null);
@@ -957,6 +984,17 @@ function bind() {
     $('#pad').focus();
   };
   $$('.tab').forEach((t) => { t.onclick = () => { state.tab = t.dataset.tab; renderPane(); }; });
+  $$('.view').forEach((v) => { v.onclick = () => { state.view = v.dataset.view; renderPane(); if (state.view === 'pad') $('#pad').focus(); }; });
+  const drawer = (open) => {
+    $('#stage').classList.toggle('closed', !open);
+    $('#drawerBtn').classList.toggle('on', open);
+    try { localStorage.setItem('drawer', open ? '1' : '0'); } catch {}
+  };
+  let saved = null;
+  try { saved = localStorage.getItem('drawer'); } catch {}
+  // on a narrow screen the drawer slides over the page, so it starts shut
+  drawer(innerWidth > 1100 && saved !== '0');
+  $('#drawerBtn').onclick = () => drawer($('#stage').classList.contains('closed'));
   $('#pane-timeline').onclick = (e) => {
     const li = e.target.closest('li.can');
     if (li && li.dataset.t !== '') playFrom(state.cur, +li.dataset.t);
