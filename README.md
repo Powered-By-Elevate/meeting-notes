@@ -26,6 +26,13 @@ the backup. Say a meeting is being recorded.
 ## What it does
 
 - **Notepad** with each line stamped on the recording's clock.
+- **The Apple Pencil** writes anywhere on the page while a finger still scrolls and types, and a
+  palm on the glass is ignored. Pen, highlighter, a stroke eraser, three inks and undo. Every
+  stroke carries its recording time, strokes written together become one handwritten note, and
+  each note shows in the transcript at its time (tap to hear that moment). Enhance sends each note
+  to Claude as a picture labelled with its time, so Claude reads the handwriting and marks its
+  words as yours. Without a Pencil, tapping a tool lets a finger draw. Settings can hand the Pencil
+  to Apple's Scribble instead, which turns handwriting into typed text.
 - **Recording in the app**, saved every 22 seconds, so a crash loses at most that.
 - **Transcription on the iPad**: Whisper (`whisper-base.en`, or small in Settings) in a background
   thread, each piece heard with the 8 seconds before it so a sentence cut at a seam is caught. The
@@ -39,7 +46,8 @@ the backup. Say a meeting is being recorded.
 - **Search** across titles, notes, transcripts and records.
 - **Sync**: each meeting as JSON to `os-vault/notes/inbox/` on the `notes-inbox` branch of
   `agentic-os` (made from main on the first sync). There, `tools/notes/notes.py meetings` writes
-  the note files the OS reads. Audio is never synced.
+  the note files the OS reads, with the Pencil page beside each as a picture (`<name>.ink.png`).
+  Audio is never synced.
 
 ## Files
 
@@ -47,11 +55,12 @@ the backup. Say a meeting is being recorded.
 | --- | --- |
 | `index.html` | The page and its styles (light and dark) |
 | `app.js` | Notes, recording, transcription queue, playback, Claude, sync |
+| `ink.js` | The Pencil: input, drawing, the eraser, handwritten notes, pictures for Claude |
 | `whisper-worker.js` | Whisper in its own thread (transformers.js 3.8.1 from jsDelivr) |
 | `pcm-worklet.js` | The microphone at 16 kHz, one second per message |
 | `sw.js`, `manifest.webmanifest`, icons | Home-screen install and offline start |
 | `docs/TEARDOWN.md` | Granola, Fireflies and Goodnotes taken apart, and the phases |
-| `test/` | The end-to-end probe and the seam unit test |
+| `test/` | The end-to-end probe, the Pencil probe and the seam unit test |
 
 ## Test
 
@@ -59,19 +68,23 @@ the backup. Say a meeting is being recorded.
 OUT=/tmp/notes-test bash test/make_audio.sh
 python3 -m http.server 8765 --bind 127.0.0.1 &
 OUT=/tmp/notes-test node test/probe.js
+OUT=/tmp/notes-test node test/ink-probe.js
 node test/trim.mjs
 ```
 
 The probe drives headless Chromium with a fake microphone playing a natural-voice meeting, the
 real Whisper model, and Claude and GitHub mocked: 26 of 26 on 2026-10-26. Test with a natural
-voice: Whisper skips robot speech (espeak).
+voice: Whisper skips robot speech (espeak). The Pencil probe sends real pen events (Chrome's
+DevTools protocol reports them as `pointerType: "pen"`, as Safari does for the Pencil): 23 of 23.
+What only an iPad can prove: palm rejection, that a Pencil touch on the notepad does not start
+Scribble or the keyboard, and how pressure feels.
 
 ## Next
 
 1. **The real app** (Matt asked for a widget, 2026-10-26): the same code wrapped with Capacitor,
    a WidgetKit widget (start a meeting, today's meetings, latest action items), recording that
    keeps going in the background, Apple's own speech recognition, TestFlight.
-2. **The Apple Pencil**: a handwriting page, strokes stamped in time, Claude reading the page, tap
-   ink to replay.
+2. **The Pencil, next**: tap ink on the page to replay its moment, lasso to move ink, search
+   inside handwriting once Claude has read it, and the Pencil's double tap (needs the real app).
 3. **Teams meetings**: Teams' own speaker-labelled transcripts through Microsoft Graph, and the
    Outlook calendar naming the meeting.
