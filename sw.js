@@ -1,7 +1,7 @@
 // Keeps the app opening with no signal. The app files and the Whisper library are served from the
 // cache and refreshed in the background. The model files cache themselves (the library does it),
 // and calls to Claude and GitHub always go to the network.
-const CACHE = 'notes-v2';
+const CACHE = 'notes-v3';
 const SHELL = ['./', 'index.html', 'app.js', 'whisper-worker.js', 'pcm-worklet.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
