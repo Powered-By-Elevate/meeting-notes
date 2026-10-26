@@ -83,6 +83,14 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .day { font-size: 11.5px; font-weight: 600; color: var(--faint); padding: 16px 10px 4px; }
 .item { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 10px; border-radius: 10px; margin-bottom: 1px; transition: background .15s; }
 .item:hover { background: var(--hover); }
+.item { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; transition: background .15s, transform .25s var(--ease); }
+.item.pressing { transform: scale(.97); background: var(--press); }
+.menu { position: fixed; z-index: 9; min-width: 210px; padding: 6px; border-radius: 14px; background: var(--paper); border: 1px solid var(--hair); box-shadow: var(--shadow-up); animation: pop .2s var(--ease) both; }
+.menu b { display: block; font-size: 12.5px; font-weight: 600; color: var(--faint); padding: 6px 10px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.menu button { display: flex; align-items: center; gap: 10px; width: 100%; border: 0; background: transparent; padding: 10px; border-radius: 9px; font-size: 15px; font-weight: 550; text-align: left; }
+.menu button:hover { background: var(--hover); }
+.menu .danger { color: var(--rec); }
+.toast button { margin-left: 14px; border: 0; background: transparent; color: inherit; font-weight: 700; text-decoration: underline; text-underline-offset: 3px; padding: 0; }
 .item.on { background: var(--paper); box-shadow: var(--shadow); }
 .item b { display: block; font-weight: 550; font-size: 14.5px; letter-spacing: -.005em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .item small { color: var(--faint); font-size: 12.5px; display: flex; gap: 6px; align-items: center; margin-top: 1px; font-variant-numeric: tabular-nums; }
@@ -251,6 +259,11 @@ dialog::backdrop { background: rgba(0,0,0,.28); }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); }
 .check { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 10px; font-size: 14px; color: var(--soft); }
 .check input { accent-color: var(--accent); width: 18px; height: 18px; margin-top: 1px; flex: none; }
+.secret { -webkit-text-security: disc; font-family: var(--mono); }
+.keyinfo { color: var(--soft) !important; }
+.keyinfo.bad, .check-row .bad { color: var(--warn) !important; }
+.check-row { display: flex; align-items: center; gap: 10px; margin: -4px 0 16px; font-size: 13.5px; color: var(--soft); }
+.check-row .good { color: var(--ok); }
 .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .toast { position: fixed; left: 50%; bottom: calc(22px + env(safe-area-inset-bottom)); transform: translateX(-50%); background: var(--solid); color: var(--on-solid); padding: 10px 16px; border-radius: 12px; font-size: 14px; font-weight: 500; box-shadow: var(--shadow-up); z-index: 10; max-width: 90vw; animation: toast .35s var(--ease) both; }
 @keyframes toast { from { opacity: 0; transform: translate(-50%, 10px); } }
@@ -357,13 +370,16 @@ dialog::backdrop { background: rgba(0,0,0,.28); }
   </main>
 </div>
 
+<div class="menu" id="itemMenu" hidden role="menu"><b id="menuTitle"></b><button class="danger" id="menuDelete" role="menuitem"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Delete meeting</button></div>
+
 <dialog id="settings">
   <form class="dlg" method="dialog" id="settingsForm">
     <h2>Settings</h2>
-    <label class="field"><span>Anthropic API key</span><input name="anthropicKey" type="password" autocomplete="off" placeholder="sk-ant-..."><small>Turns on Enhance and Ask. Kept on this iPad only.</small></label>
+    <label class="field"><span>Anthropic API key</span><input name="anthropicKey" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore placeholder="sk-ant-..."><small class="keyinfo" data-key="anthropicKey"></small><small>Turns on Enhance and Ask. Kept on this iPad only.</small></label>
     <label class="field"><span>Claude model</span>
       <select name="model"><option value="claude-sonnet-5-5">Sonnet 5.5 (fast, the default)</option><option value="claude-opus-5-5">Opus 5.5 (deepest)</option></select></label>
-    <label class="field"><span>GitHub token</span><input name="githubToken" type="password" autocomplete="off" placeholder="github_pat_..."><small>Sends each meeting into the Agentic OS repo so every Claude session can read it. Kept on this iPad only.</small></label>
+    <label class="field"><span>GitHub token</span><input name="githubToken" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore placeholder="github_pat_..."><small class="keyinfo" data-key="githubToken"></small><small>Sends each meeting into the Agentic OS repo so every Claude session can read it. Kept on this iPad only.</small></label>
+    <div class="check-row"><button type="button" class="btn" id="ghCheck">Check GitHub</button><span id="ghCheckOut"></span></div>
     <label class="field"><span>Repository and branch</span><input name="repo" autocomplete="off"><small>owner/repo@branch</small></label>
     <label class="field"><span>Transcription model</span>
       <select name="whisper"><option value="onnx-community/whisper-base.en">Whisper base (about 200 MB, quick)</option><option value="onnx-community/whisper-small.en">Whisper small (about 590 MB, more accurate)</option></select></label>

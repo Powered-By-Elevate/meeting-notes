@@ -44,6 +44,10 @@ the backup. Say a meeting is being recorded.
   expected names fixes transcript mishearings.
 - **Ask** about one meeting, or start with `all:` to ask across all of them.
 - **Search** across titles, notes, transcripts and records.
+- **Delete**: long press a meeting in the list (or right-click) and tap Delete, or use the trash
+  icon. It leaves the list at once and is gone for good after five seconds, with Undo until then.
+- **Settings** shows each key's length and start, so a key cut short when pasted shows, and Check
+  GitHub says whether the token works and can reach the repo.
 - **Sync**: each meeting as JSON to `os-vault/notes/inbox/` on the `notes-inbox` branch of
   `agentic-os` (made from main on the first sync). There, `tools/notes/notes.py meetings` writes
   the note files the OS reads, with the Pencil page beside each as a picture (`<name>.ink.png`).
@@ -69,6 +73,7 @@ OUT=/tmp/notes-test bash test/make_audio.sh
 python3 -m http.server 8765 --bind 127.0.0.1 &
 OUT=/tmp/notes-test node test/probe.js
 OUT=/tmp/notes-test node test/ink-probe.js
+node test/list-probe.js
 node test/trim.mjs
 ```
 
