@@ -63,7 +63,7 @@ node test/trim.mjs
 ```
 
 The probe drives headless Chromium with a fake microphone playing a natural-voice meeting, the
-real Whisper model, and Claude and GitHub mocked: 23 of 23 on 2026-10-26. Test with a natural
+real Whisper model, and Claude and GitHub mocked: 26 of 26 on 2026-10-26. Test with a natural
 voice: Whisper skips robot speech (espeak).
 
 ## Next

@@ -210,11 +210,55 @@ function renderList() {
   const unsynced = state.meetings.filter((m) => !m.synced || m.synced.at < m.updated).length;
   $('#syncState').textContent = !settings.githubToken ? 'Sync is off until a GitHub token is in Settings'
     : unsynced ? `${unsynced} meeting${unsynced > 1 ? 's' : ''} waiting to sync` : 'Everything is synced';
+  $('#syncState').classList.toggle('good', !!settings.githubToken && !unsynced);
 }
 
 // ---------------------------------------------------------------- open a meeting
 
+// A meeting with nothing in it: no title, people, notes, audio or record. These are left behind
+// by opening the app or tapping + by mistake, and are never kept or synced.
+export function isEmpty(m) {
+  return !m.title.trim() && !m.people.trim() && !m.lines.some((l) => l.text.trim()) && !m.chunks && !m.enhanced && !m.qa.length;
+}
+
+async function forget(m, { remote = true } = {}) {
+  state.meetings = state.meetings.filter((x) => x.id !== m.id);
+  for (const p of await audioFor(m.id)) await del('audio', p.key);
+  await del('meetings', m.id);
+  if (remote && m.synced?.path && settings.githubToken) {
+    // best effort: the synced copy goes too, and a failure leaves only a file the OS ignores
+    try {
+      const [repo, branch = 'notes-inbox'] = settings.repo.split('@');
+      const f = await gh(`/repos/${repo}/contents/${m.synced.path}?ref=${branch}`);
+      if (f) await gh(`/repos/${repo}/contents/${m.synced.path}`, { method: 'DELETE', body: JSON.stringify({ message: `Notes: delete ${m.title || 'Untitled meeting'}`, sha: f.sha, branch }) });
+    } catch { /* offline or refused */ }
+  }
+}
+
+async function dropIfEmpty(m) {
+  if (m && rec.meeting !== m.id && isEmpty(m)) await forget(m, { remote: false });
+}
+
+function showEmpty() {
+  state.cur = null;
+  $('#meeting').hidden = true;
+  $('#empty').hidden = false;
+  renderList();
+}
+
+async function removeCurrent() {
+  const m = state.cur;
+  if (!m) return;
+  if (!isEmpty(m) && !confirm(`Delete "${m.title || 'Untitled meeting'}"? Its notes, transcript, audio and synced copy all go.`)) return;
+  if (rec.meeting === m.id) await stopRecording();
+  work.queue = work.queue.filter((j) => j.meeting !== m.id);
+  await forget(m);
+  showEmpty();
+  toast('Meeting deleted.');
+}
+
 function open(m) {
+  if (state.cur && state.cur !== m) dropIfEmpty(state.cur);
   state.cur = m;
   $('#empty').hidden = true;
   $('#meeting').hidden = false;
@@ -232,11 +276,14 @@ function open(m) {
 }
 
 async function create() {
+  // an empty meeting already open is reused, so + never stacks up blanks
+  if (state.cur && isEmpty(state.cur) && rec.meeting !== state.cur.id) { $('#title').focus(); return; }
   const m = newMeeting();
   state.meetings.push(m);
-  await put('meetings', m);
+  // open first, save after: typing straight after Command K must land in the new meeting
   open(m);
   $('#title').focus();
+  await put('meetings', m);
 }
 
 // ---------------------------------------------------------------- recording
@@ -274,8 +321,14 @@ async function startRecording() {
   const mute = ctx.createGain();
   mute.gain.value = 0;
   src.connect(node).connect(mute).connect(ctx.destination);
+  // the live waveform on the record button
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  src.connect(analyser);
   node.port.onmessage = (e) => onSecond(e.data);
-  Object.assign(rec, { meeting: m.id, ctx, node, buf: [], startedAt: Date.now(), base: m.durationMs });
+  Object.assign(rec, { meeting: m.id, ctx, node, analyser, buf: [], startedAt: Date.now(), base: m.durationMs });
+  document.body.classList.add('listening');
+  drawWave();
   try { rec.wake = await navigator.wakeLock?.request('screen'); } catch { /* not offered */ }
   rec.timer = setInterval(renderRec, 500);
   if (settings.liveCaptions) startCaptions();
@@ -284,13 +337,43 @@ async function startRecording() {
   status('Recording. Keep the app open and the screen on while it records.');
 }
 
+// Twenty-two bars that follow the voice, smoothed so they glide rather than flicker.
+const bars = new Array(22).fill(0);
+function drawWave() {
+  const c = $('#wave');
+  const an = rec.analyser;
+  if (!an || !c) return;
+  const g = c.getContext('2d');
+  const data = new Uint8Array(an.fftSize);
+  an.getByteTimeDomainData(data);
+  const step = Math.floor(data.length / bars.length);
+  for (let i = 0; i < bars.length; i++) {
+    let s = 0;
+    for (let j = 0; j < step; j++) { const v = (data[i * step + j] - 128) / 128; s += v * v; }
+    const lvl = Math.min(1, Math.sqrt(s / step) * 5);
+    bars[i] += (lvl - bars[i]) * 0.35;
+  }
+  g.clearRect(0, 0, c.width, c.height);
+  const w = c.width / bars.length;
+  g.fillStyle = '#ffffff';
+  bars.forEach((b, i) => {
+    const h = Math.max(4, b * c.height * 0.95);
+    const x = i * w + w * 0.22, y = (c.height - h) / 2, bw = w * 0.56;
+    g.globalAlpha = 0.55 + b * 0.45;
+    g.beginPath();
+    g.roundRect ? g.roundRect(x, y, bw, h, bw / 2) : g.rect(x, y, bw, h);
+    g.fill();
+  });
+  requestAnimationFrame(drawWave);
+}
+
 function onSecond(int16) {
   rec.buf.push(int16);
-  // level meter from this second of audio
+  // level of this second of audio
   let sum = 0;
   for (let i = 0; i < int16.length; i += 8) sum += (int16[i] / 32768) ** 2;
   const rms = Math.sqrt(sum / (int16.length / 8));
-  $('#meter i').style.width = Math.min(100, Math.round(rms * 400)) + '%';
+  rec.peak = Math.max(rec.peak || 0, rms);
   if (rec.buf.length >= CHUNK_SECONDS) flushChunk();
 }
 
@@ -323,7 +406,8 @@ async function stopRecording() {
   clearInterval(rec.timer);
   if (m) { m.durationMs = elapsed(); delete m._chunkEnd; touch(m); }
   rec.meeting = null;
-  $('#meter i').style.width = '0';
+  rec.analyser = null;
+  document.body.classList.remove('listening');
   renderRec();
   renderList();
   status(work.queue.length || work.busy ? 'Stopped. Finishing the transcript.' : 'Stopped.');
@@ -336,7 +420,7 @@ function renderRec() {
   $('#recBtn').disabled = other;
   const ms = on ? elapsed() : state.cur?.durationMs || 0;
   $('#recLabel').textContent = on ? 'Stop ' + clock(ms) : other ? 'Recording elsewhere' : ms ? 'Record more · ' + clock(ms) : 'Record';
-  $('#meter').hidden = !on;
+  $('#wave').hidden = !on;
 }
 
 // Safari's own speech recognition: fast captions while Whisper catches up. Unreliable on iPad
@@ -443,7 +527,12 @@ function showWork() {
 
 async function onWorker(msg) {
   if (msg.type === 'progress') {
-    if (msg.total && state.cur) status(`Downloading the transcription model, ${Math.round((100 * msg.loaded) / msg.total)}% of ${msg.file}`);
+    // the model comes as several files: count the big ones together so the number only climbs
+    work.dl = work.dl || {};
+    work.dl[msg.file] = [msg.loaded, msg.total];
+    const parts = Object.values(work.dl).filter(([, tot]) => tot > 5e6);
+    const got = parts.reduce((n, [l]) => n + l, 0), all = parts.reduce((n, [, tot]) => n + tot, 0);
+    if (all && state.cur) status(`Setting up transcription on this iPad, ${Math.round(got / 1e6)} of ${Math.round(all / 1e6)} MB. This happens once.`);
     return;
   }
   if (msg.type === 'ready') { work.ready = true; work.device = msg.device; return; }
@@ -719,7 +808,7 @@ async function enhance() {
   renderPane();
   const btn = $('#enhanceBtn');
   btn.disabled = true;
-  btn.textContent = 'Writing…';
+  btn.innerHTML = 'Writing<span class="writing"><i></i><i></i><i></i></span>';
   const pane = $('#pane-notes');
   const live = document.createElement('div');
   live.className = 'md';
@@ -828,7 +917,7 @@ async function sync(m, quiet = true) {
 async function syncAll() {
   if (!settings.githubToken || !navigator.onLine) return;
   for (const m of state.meetings) {
-    if (rec.meeting === m.id) continue;
+    if (rec.meeting === m.id || isEmpty(m)) continue;
     if (!m.synced || m.synced.at < m.updated) {
       try { await sync(m); } catch (err) { $('#syncState').textContent = err.message; return; }
     }
@@ -846,6 +935,7 @@ function bind() {
   $('#newBtn').onclick = create;
   $('#emptyNew').onclick = create;
   $('#listBtn').onclick = () => $('#app').classList.toggle('list-open');
+  $('#delBtn').onclick = removeCurrent;
   $('#search').oninput = (e) => { state.query = e.target.value; renderList(); };
   $('#list').onclick = (e) => {
     const b = e.target.closest('.item');
@@ -930,13 +1020,14 @@ async function boot() {
     const end = pieces.reduce((n, p) => Math.max(n, p.startMs + p.ms), 0);
     if (end > m.durationMs) { m.durationMs = end; await put('meetings', m); }
   }
+  for (const m of [...state.meetings]) await dropIfEmpty(m);
   renderList();
   const last = state.meetings.sort((a, b) => b.updated - a.updated)[0];
   if (last && Date.now() - last.updated < 6 * 3600 * 1000) open(last);
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   syncAll();
-  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance };
+  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance, isEmpty, removeCurrent, render: () => { renderList(); renderPane(); }, open };
 }
 
 boot();

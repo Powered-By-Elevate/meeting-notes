@@ -98,8 +98,9 @@ function sse(text) {
   await page.waitForTimeout(8000);
   await page.keyboard.type('Morris 6.25 5yr\n');
   await page.screenshot({ path: path.join(OUT, '02-recording.png') });
-  const meter = await page.$eval('#meter i', (e) => parseFloat(e.style.width) || 0);
-  check('the level meter moves', meter > 0, meter + '%');
+  const meter = await page.evaluate(() => window.__notes.rec.peak || 0);
+  const waveOn = await page.evaluate(() => !document.querySelector('#wave').hidden);
+  check('the waveform shows and hears the voice', meter > 0.01 && waveOn, meter.toFixed(3));
 
   // let two 30-second pieces land, then stop
   await page.waitForTimeout(46000);
@@ -167,6 +168,25 @@ function sse(text) {
   await page.fill('#search', 'appraisal');
   check('search finds words from the transcript', (await page.$$('.item')).length === 1);
   check('the meeting survives a reload', (await page.inputValue('#title')) === 'Riverbend and Timberley');
+
+  // empty meetings are not kept, and a meeting can be deleted
+  await page.keyboard.press('Control+k');
+  await page.waitForFunction(() => window.__notes.state.cur.title === '');
+  const n1 = await page.evaluate(() => window.__notes.state.meetings.length);
+  await page.keyboard.press('Control+k');
+  check('+ reuses an empty meeting instead of stacking blanks', (await page.evaluate(() => window.__notes.state.meetings.length)) === n1);
+  await page.click('.item >> nth=-1');
+  await page.waitForTimeout(400);
+  check('an empty meeting is dropped when you leave it', (await page.evaluate(() => window.__notes.state.meetings.length)) === n1 - 1);
+  await page.keyboard.press('Control+k');
+  await page.fill('#title', 'Throwaway');
+  await page.waitForTimeout(600);
+  page.once('dialog', (d) => d.accept());
+  await page.click('#delBtn');
+  await page.waitForSelector('#empty:not([hidden])');
+  check('Delete removes the meeting', !(await page.evaluate(() => window.__notes.state.meetings.some((m) => m.title === 'Throwaway'))));
+  await page.click('.item >> nth=0');
+  await page.waitForSelector('#meeting:not([hidden])');
 
   // portrait and dark
   await page.click('.tab[data-tab="notes"]');
