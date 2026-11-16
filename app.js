@@ -3,6 +3,7 @@
 // and each needs a key Matt enters in Settings. Design notes: README.md.
 
 import { InkLayer, groups, render, bounds, PAPER, UNITS } from './ink.js';
+import { resample, snapRatio, voiceStats, looksSlowed, plan } from './audio-fix.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -33,6 +34,7 @@ export const TEMPLATES = {
 const CHUNK_SECONDS = 22;
 const OVERLAP_SECONDS = 8;
 const SAMPLE_RATE = 16000;
+const ENHANCE_MAX_CHARS = 200000;
 
 // ---------------------------------------------------------------- settings
 
@@ -85,7 +87,39 @@ async function tx(store, mode, fn) {
 const put = (store, v) => tx(store, 'readwrite', (s) => s.put(v));
 const del = (store, k) => tx(store, 'readwrite', (s) => s.delete(k));
 const getAll = (store) => tx(store, 'readonly', (s) => s.getAll());
-const audioFor = (id) => tx('audio', 'readonly', (s) => s.index('meeting').getAll(id));
+const getPiece = (key) => tx('audio', 'readonly', (s) => s.get(key));
+const pieceKeys = (id) => tx('audio', 'readonly', (s) => s.index('meeting').getAllKeys(id));
+// What each saved piece is, without keeping its samples: a long meeting's audio is hundreds of MB,
+// too much to hold at once on an iPad, so the cursor reads one piece at a time and lets it go.
+async function pieceMeta(id) {
+  const d = await db();
+  return new Promise((res, rej) => {
+    const out = [];
+    const t = d.transaction('audio', 'readonly');
+    const r = t.objectStore('audio').index('meeting').openCursor(IDBKeyRange.only(id));
+    r.onsuccess = () => {
+      const c = r.result;
+      if (!c) return;
+      const p = c.value;
+      out.push({ key: p.key, seq: p.seq, startMs: p.startMs, ms: p.ms, rate: p.rate || 0, final: !!p.final, transcribed: !!p.transcribed, n: p.data.length });
+      c.continue();
+    };
+    t.oncomplete = () => res(out.sort((a, b) => a.seq - b.seq));
+    t.onerror = () => rej(t.error);
+  });
+}
+// one repaired piece and the repair's progress, saved together so a stop never loses track
+const putPieceAndMeeting = async (piece, m) => {
+  const d = await db();
+  return new Promise((res, rej) => {
+    const t = d.transaction(['audio', 'meetings'], 'readwrite');
+    t.objectStore('audio').put(piece);
+    t.objectStore('meetings').put(m);
+    t.oncomplete = () => res();
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  });
+};
 
 // ---------------------------------------------------------------- the meeting model
 
@@ -99,6 +133,7 @@ function newMeeting() {
     ink: [],            // Pencil strokes, see ink.js: [{id, tool, color, w, t, at, end, pts}]
     durationMs: 0,      // total recorded so far, across every take
     chunks: 0,          // 22-second audio pieces saved
+    wallMs: 0,          // the same total by the wall clock, which nothing ever rewrites
     transcript: [],     // [{t0, t1, text, seq}] from Whisper
     captions: [],       // [{t, text}] Safari's live captions, replaced by Whisper's
     enhanced: null,     // {md, model, at}
@@ -246,7 +281,7 @@ export function isEmpty(m) {
 
 async function forget(m, { remote = true } = {}) {
   state.meetings = state.meetings.filter((x) => x.id !== m.id);
-  for (const p of await audioFor(m.id)) await del('audio', p.key);
+  for (const k of await pieceKeys(m.id)) await del('audio', k);
   await del('meetings', m.id);
   if (remote && m.synced?.path && settings.githubToken) {
     // best effort: the synced copy goes too, and a failure leaves only a file the OS ignores
@@ -403,7 +438,8 @@ function open(m) {
   renderRec();
   renderList();
   renderPane();
-  queueUntranscribed(m);
+  if (m.fix) runFix(m); // a Re-transcribe that was stopped part way carries on
+  else queueUntranscribed(m);
 }
 
 async function create() {
@@ -419,7 +455,7 @@ async function create() {
 
 // ---------------------------------------------------------------- recording
 
-const rec = { meeting: null, ctx: null, stream: null, node: null, buf: [], startedAt: 0, base: 0, wake: null, timer: 0, speech: null, interim: '' };
+const rec = { meeting: null, ctx: null, stream: null, node: null, buf: [], startedAt: 0, base: 0, wake: null, timer: 0, speech: null, interim: '', clock: null };
 
 function elapsed() {
   return rec.meeting ? rec.base + (Date.now() - rec.startedAt) : null;
@@ -435,16 +471,12 @@ async function startRecording() {
     status('The microphone was refused. Allow it in Settings, Safari, Microphone, then try again.', true);
     return;
   }
-  // a 16 kHz context lets the browser resample properly. Where it refuses, the worklet does it.
-  let ctx, src;
-  try {
-    ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
-    src = ctx.createMediaStreamSource(rec.stream);
-  } catch {
-    try { ctx?.close(); } catch { /* never opened */ }
-    ctx = new AudioContext();
-    src = ctx.createMediaStreamSource(rec.stream);
-  }
+  // The context runs at the device's own rate and the worklet resamples to 16 kHz. Asking for a
+  // 16 kHz context is what broke the 2026-11-16 meeting: iPad Safari agreed, reported 16 kHz, and
+  // went on feeding 48 kHz, so every second saved held three. The clock check below catches any
+  // device that still disagrees with itself.
+  const ctx = new AudioContext();
+  const src = ctx.createMediaStreamSource(rec.stream);
   await ctx.audioWorklet.addModule('pcm-worklet.js');
   // Safari can open the context paused after the microphone prompt
   if (ctx.state !== 'running') await ctx.resume().catch(() => {});
@@ -457,7 +489,8 @@ async function startRecording() {
   analyser.fftSize = 1024;
   src.connect(analyser);
   node.port.onmessage = (e) => onSecond(e.data);
-  Object.assign(rec, { meeting: m.id, ctx, node, analyser, buf: [], startedAt: Date.now(), base: m.durationMs });
+  Object.assign(rec, { meeting: m.id, ctx, node, analyser, buf: [], startedAt: Date.now(), base: m.durationMs, peak: 0,
+    clock: { t0: 0, n: 0, ratio: ctx.sampleRate / SAMPLE_RATE, pending: 0, checked: false, fixed: 0 } });
   document.body.classList.add('listening');
   drawWave();
   try { rec.wake = await navigator.wakeLock?.request('screen'); } catch { /* not offered */ }
@@ -498,28 +531,83 @@ function drawWave() {
   requestAnimationFrame(drawWave);
 }
 
-function onSecond(int16) {
+// The clock check: the worklet sends one second of 16 kHz audio per message, so messages should
+// arrive once a second by the wall clock. If they come three times as fast, the device is feeding
+// 48 kHz while saying 16 kHz: the worklet gets the true ratio and what was gathered is resampled.
+function checkClock() {
+  const c = rec.clock;
+  const now = performance.now();
+  if (!c.t0) { c.t0 = now; c.n = 0; return; }
+  c.n++;
+  const secs = (now - c.t0) / 1000;
+  if (secs < (c.checked ? 20 : c.long ? 15 : 5) || c.pending) return;
+  const r = c.n / secs; // seconds of audio per second of clock
+  const want = c.ratio * r;
+  const snapped = snapRatio(want);
+  // a jump to a real hardware rate is fixed at once, anything else only after a longer look
+  if (Math.abs(r - 1) > 0.05 && snapped === want && secs < 15) { c.long = true; return; }
+  c.t0 = now;
+  c.n = 0;
+  c.checked = true;
+  if (Math.abs(r - 1) <= 0.05) return;
+  c.pending = snapped / c.ratio;
+  c.ratio = snapped;
+  rec.node.port.postMessage({ ratio: snapped });
+  // everything already gathered was made at the old ratio
+  rec.buf = rebuffer(rec.buf, c.pending);
+  c.fixed = Math.round(snapped * SAMPLE_RATE);
+  status(`The microphone was sending ${(c.fixed / 1000).toFixed(1)} kHz while saying ${(rec.ctx.sampleRate / 1000).toFixed(1)} kHz. Corrected, the recording is fine.`, true);
+}
+
+function rebuffer(parts, ratio) {
+  const n = parts.reduce((a, p) => a + p.length, 0);
+  if (!n) return [];
+  const all = new Int16Array(n);
+  let o = 0;
+  for (const p of parts) { all.set(p, o); o += p.length; }
+  const out = resample(all, ratio);
+  const res = [];
+  for (let i = 0; i < out.length; i += SAMPLE_RATE) res.push(out.slice(i, i + SAMPLE_RATE));
+  return res;
+}
+
+const buffered = () => rec.buf.reduce((a, p) => a + p.length, 0);
+
+function onSecond(msg) {
+  const c = rec.clock;
+  if (!(msg instanceof Int16Array)) {
+    if (msg && msg.ack) c.pending = 0; // from here on the worklet runs at the corrected ratio
+    return;
+  }
+  // a message sent before the worklet took the new ratio still needs resampling
+  const int16 = c.pending ? resample(msg, c.pending) : msg;
   rec.buf.push(int16);
+  if (!c.pending) checkClock();
   // level of this second of audio
   let sum = 0;
   for (let i = 0; i < int16.length; i += 8) sum += (int16[i] / 32768) ** 2;
-  const rms = Math.sqrt(sum / (int16.length / 8));
+  const rms = Math.sqrt(sum / Math.max(1, int16.length / 8));
   rec.peak = Math.max(rec.peak || 0, rms);
-  if (rec.buf.length >= CHUNK_SECONDS) flushChunk();
+  // nothing is saved until the clock has been checked once
+  if (c.checked && buffered() >= CHUNK_SECONDS * SAMPLE_RATE) flushChunk();
 }
 
 async function flushChunk(final = false) {
   const m = state.meetings.find((x) => x.id === rec.meeting);
   if (!m || !rec.buf.length) return;
-  const secs = rec.buf.length;
-  const data = new Int16Array(secs * SAMPLE_RATE);
-  rec.buf.forEach((s, i) => data.set(s, i * SAMPLE_RATE));
+  const parts = rec.buf;
   rec.buf = [];
+  const n = parts.reduce((a, p) => a + p.length, 0);
+  const data = new Int16Array(n);
+  let o = 0;
+  for (const p of parts) { data.set(p, o); o += p.length; }
+  const ms = Math.round((n / SAMPLE_RATE) * 1000);
   const seq = m.chunks++;
   // pieces are written in order, so each starts where the last ended, the first at the take's start
   const startMs = m._chunkEnd ?? m.durationMs;
-  m._chunkEnd = startMs + secs * 1000;
-  const piece = { key: m.id + ':' + seq, meeting: m.id, seq, startMs, ms: secs * 1000, data, transcribed: false, final };
+  m._chunkEnd = startMs + ms;
+  // rate marks a piece saved at a true 16 kHz, which Re-transcribe never resamples again
+  const piece = { key: m.id + ':' + seq, meeting: m.id, seq, startMs, ms, data, transcribed: false, final, rate: SAMPLE_RATE };
   await put('audio', piece);
   touch(m);
   transcribeLater(m, piece);
@@ -535,7 +623,7 @@ async function stopRecording() {
   try { await rec.wake?.release(); } catch { /* gone */ }
   stopCaptions();
   clearInterval(rec.timer);
-  if (m) { m.durationMs = elapsed(); delete m._chunkEnd; touch(m); }
+  if (m) { m.durationMs = elapsed(); m.wallMs = m.durationMs; delete m._chunkEnd; touch(m); }
   rec.meeting = null;
   rec.analyser = null;
   document.body.classList.remove('listening');
@@ -616,16 +704,17 @@ function transcribeLater(m, piece) {
 }
 
 async function queueUntranscribed(m) {
-  const pieces = await audioFor(m.id);
-  pieces.sort((a, b) => a.seq - b.seq).filter((p) => !p.transcribed).forEach((p) => transcribeLater(m, p));
+  if (m.fix) return; // a repair in progress queues its pieces when it is done
+  const pieces = await pieceMeta(m.id);
+  pieces.filter((p) => !p.transcribed).forEach((p) => transcribeLater(m, p));
 }
 
 async function pump() {
   if (work.busy || !work.queue.length) return;
   const job = work.queue.shift();
   work.busy = job; // set before any await, so the queue never looks idle between pieces
-  const piece = await tx('audio', 'readonly', (s) => s.get(job.key));
-  if (!piece) { work.busy = null; return pump(); }
+  const piece = await getPiece(job.key);
+  if (!piece || state.meetings.find((x) => x.id === job.meeting)?.fix) { work.busy = null; return pump(); }
   // skip near-silence: Whisper invents words when there are none
   let sum = 0;
   for (let i = 0; i < piece.data.length; i += 16) sum += (piece.data[i] / 32768) ** 2;
@@ -732,14 +821,199 @@ function dist(a, b) {
   return d[b.length];
 }
 
+// ---------------------------------------------------------------- Re-transcribe: repair saved audio
+
+// Meetings recorded before the 16 kHz fix saved 48 kHz audio labelled as 16 kHz: every piece holds
+// three times the samples its 22 seconds should, Whisper heard speech at a third of its speed, and
+// the transcript clock ran three times long. The samples themselves are all there, so the audio
+// can be resampled to its true rate and heard again.
+
+// How many saved samples make one true 16 kHz sample, and how that was found.
+async function suggestRatio(m, meta) {
+  const legacy = meta.filter((p) => !p.rate);
+  const savedMs = legacy.reduce((a, p) => a + p.ms, 0);
+  const allMs = meta.reduce((a, p) => a + p.ms, 0);
+  const newMs = allMs - savedMs;
+  const fromWall = (wall, why) => {
+    const real = wall - newMs;
+    if (!(real > 0) || !savedMs) return null;
+    const r = savedMs / real;
+    return r > 1.05 && r < 6.5 ? { ratio: snapRatio(r), why } : null;
+  };
+  // 1. the wall clock this app now keeps beside every recording
+  // 2. the recorded length, if nothing has stretched it since
+  const a = (m.wallMs && fromWall(m.wallMs, 'the recording clock')) || fromWall(m.durationMs, 'the recorded length');
+  if (a) return a;
+  // 3. the copy synced to the OS, saved before anything could stretch it
+  if (m.synced?.path && settings.githubToken) {
+    try {
+      const [repo, branch = 'notes-inbox'] = settings.repo.split('@');
+      // the raw form: a long meeting's file is past the 1 MB the plain form will carry
+      const doc = await gh(`/repos/${repo}/contents/${m.synced.path}?ref=${branch}`, { headers: { accept: 'application/vnd.github.raw+json' } });
+      const b = doc && fromWall(doc.durationMs, 'the copy synced to the OS');
+      if (b) return b;
+    } catch { /* offline: listen instead */ }
+  }
+  // 4. listen: slowed speech sits low and has almost nothing above 3 kHz
+  const sample = [];
+  const step = Math.max(1, Math.floor(legacy.length / 12));
+  for (let i = 0; i < legacy.length && sample.length < 12; i += step) sample.push((await getPiece(legacy[i].key)).data);
+  if (sample.length && looksSlowed(voiceStats(sample))) return { ratio: 3, why: 'the sound of the voices (they play three times too slow)' };
+  return { ratio: 1, why: 'nothing found wrong with the rate' };
+}
+
+async function retranscribe(m) {
+  if (!m) return;
+  if (rec.meeting === m.id) { toast('Stop the recording first.'); return; }
+  if (work.busy?.meeting === m.id) { toast('This meeting is still transcribing. Try again when it finishes.', 5000); return; }
+  if (m.fix) { runFix(m); return; }
+  const meta = await pieceMeta(m.id);
+  if (!meta.length) {
+    toast(settings.deleteAudio
+      ? 'No audio is saved for this meeting: "Delete audio once transcribed" is on in Settings. It cannot be re-transcribed.'
+      : 'No audio is saved for this meeting on this iPad, so it cannot be re-transcribed.', 7000);
+    return;
+  }
+  status('Checking the saved audio.');
+  const sug = await suggestRatio(m, meta);
+  const legacyMs = meta.filter((p) => !p.rate).reduce((a, p) => a + p.ms, 0);
+  const otherMs = meta.reduce((a, p) => a + p.ms, 0) - legacyMs;
+  const realMin = ((legacyMs / sug.ratio + otherMs) / 60000).toFixed(1);
+  let ratio = sug.ratio;
+  if (legacyMs) {
+    const savedMin = (legacyMs / 60000).toFixed(1);
+    const answer = prompt(`The saved audio is labelled ${savedMin} minutes. From ${sug.why}, the meeting really ran ${realMin} minutes${ratio > 1.02 ? ` (saved at ${(ratio * 16).toFixed(1)} kHz, so it will be resampled)` : ''}.\n\nHow long was the meeting, in minutes? Tap OK to repair it and transcribe it again. This replaces the current transcript.`, realMin);
+    if (answer === null) { status(''); return; }
+    const mins = parseFloat(answer);
+    if (!(mins > 0)) { toast('That is not a number of minutes.'); status(''); return; }
+    // the offered length unchanged keeps the exact rate it came from, not one rounded to a tenth
+    if (answer.trim() !== realMin) {
+      const real = mins * 60000 - otherMs;
+      ratio = real > 0 ? snapRatio(legacyMs / real) : 1;
+    }
+    if (ratio < 0.98 || ratio > 6.5) { toast('That length does not fit the saved audio.', 5000); status(''); return; }
+  } else if (!confirm('Transcribe this meeting again? This replaces the current transcript.')) { status(''); return; }
+  const p = plan(meta, ratio);
+  work.queue = work.queue.filter((j) => j.meeting !== m.id);
+  // the old transcript and the record built on it go: both came from the broken audio
+  m.fix = { ...p, next: 0, oldSeqs: meta.map((x) => x.seq) };
+  m.transcript = [];
+  m.captions = [];
+  if (m.enhanced?.md?.trim()) m.enhancedBefore = m.enhanced;
+  m.enhanced = null;
+  await put('meetings', m);
+  renderPane();
+  runFix(m);
+}
+
+const fixing = new Set();
+async function runFix(m) {
+  if (fixing.has(m.id)) return;
+  fixing.add(m.id);
+  try {
+    const f = m.fix;
+    const total = f.groups.length;
+    // where each new piece starts: touching pieces follow on, a new take keeps its own start
+    let end = 0;
+    for (let k = 0; k < f.next; k++) end = f.groups[k].newEnd ?? end;
+    for (let k = f.next; k < total; k++) {
+      const g = f.groups[k];
+      const parts = [];
+      for (const seq of g.seqs) {
+        const p = await getPiece(m.id + ':' + seq);
+        if (!p) throw new Error(`piece ${seq} is missing`);
+        parts.push(p.data);
+      }
+      const n = parts.reduce((a, d) => a + d.length, 0);
+      let data = new Int16Array(n);
+      let o = 0;
+      for (const d of parts) { data.set(d, o); o += d.length; }
+      if (g.legacy && f.ratio !== 1) data = resample(data, f.ratio);
+      const ms = Math.round((data.length / SAMPLE_RATE) * 1000);
+      const startMs = k > 0 && g.joined ? end : Math.max(end, g.legacy && f.ratio !== 1 && k === 0 ? 0 : g.oldStart);
+      g.newEnd = startMs + ms;
+      end = g.newEnd;
+      f.next = k + 1;
+      const piece = { key: m.id + ':' + k, meeting: m.id, seq: k, startMs, ms, data, transcribed: false, final: !!g.final, rate: SAMPLE_RATE };
+      await putPieceAndMeeting(piece, m);
+      if (state.cur?.id === m.id && (k % 5 === 0 || k === total - 1)) status(`Repairing the audio, ${k + 1} of ${total} pieces.`);
+      if (k % 4 === 3) await new Promise((r) => setTimeout(r, 0)); // let the page breathe
+    }
+    // the old pieces past the new end go
+    for (const seq of f.oldSeqs) if (seq >= total) await del('audio', m.id + ':' + seq);
+    m.chunks = total;
+    m.durationMs = end;
+    m.wallMs = end;
+    delete m.fix;
+    touch(m);
+    flush();
+    if (state.cur?.id === m.id) { status(`Audio repaired, ${clock(end)} long. Transcribing ${total} pieces again. Keep the app open.`); renderPane(); }
+    await queueUntranscribed(m);
+  } catch (err) {
+    status('Re-transcribe stopped: ' + err.message + '. Tap Re-transcribe to carry on.', true);
+  } finally {
+    fixing.delete(m.id);
+  }
+}
+
+// The whole meeting as one 16 kHz mono WAV, built a piece at a time. Audio never syncs, so this is
+// the way to keep a recording off the iPad.
+async function downloadAudio(m) {
+  if (!m) return;
+  if (m.fix) { toast('Wait for Re-transcribe to finish repairing the audio.'); return; }
+  const meta = await pieceMeta(m.id);
+  if (!meta.length) { toast('No audio is saved for this meeting on this iPad.', 5000); return; }
+  status('Putting the audio together.');
+  const legacy = meta.some((p) => !p.rate);
+  const ratio = legacy ? (await suggestRatio(m, meta)).ratio : 1;
+  const parts = [];
+  let samples = 0;
+  for (const p of meta) {
+    let d = (await getPiece(p.key)).data;
+    if (!p.rate && ratio !== 1) d = resample(d, ratio);
+    parts.push(d);
+    samples += d.length;
+  }
+  const h = new DataView(new ArrayBuffer(44));
+  const s = (o, t) => [...t].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
+  s(0, 'RIFF'); h.setUint32(4, 36 + samples * 2, true); s(8, 'WAVE'); s(12, 'fmt ');
+  h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
+  h.setUint32(24, SAMPLE_RATE, true); h.setUint32(28, SAMPLE_RATE * 2, true);
+  h.setUint16(32, 2, true); h.setUint16(34, 16, true); s(36, 'data'); h.setUint32(40, samples * 2, true);
+  const name = `${slug(m)}.wav`;
+  const file = new File([h.buffer, ...parts], name, { type: 'audio/wav' });
+  lastDownload = file;
+  const mb = Math.round(file.size / 1e6);
+  status(`The audio is ready: ${clock((samples / SAMPLE_RATE) * 1000)}, ${mb} MB.${legacy && ratio !== 1 ? ' Corrected to its true speed.' : ''}`);
+  // building takes a moment, so the save gets its own tap (Safari wants a fresh tap to share)
+  toast(`Audio ready, ${mb} MB.`, 20000, { label: 'Save', fn: () => saveFile(file) });
+}
+let lastDownload = null;
+async function saveFile(file) {
+  if (navigator.canShare?.({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: file.name }); return; } catch (err) { if (err.name === 'AbortError') return; }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file);
+  a.download = file.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+}
+
 // ---------------------------------------------------------------- playback: tap a line to hear it
 
 let player = null;
 async function playFrom(m, ms) {
-  const pieces = (await audioFor(m.id)).sort((a, b) => a.seq - b.seq);
-  const from = pieces.findIndex((p) => p.startMs + p.ms > ms);
-  if (from < 0) { toast(pieces.length ? 'No audio at that moment.' : 'The audio for this meeting was deleted.'); return; }
-  const take = pieces.slice(from, from + 27); // about ten minutes
+  const meta = await pieceMeta(m.id);
+  const from = meta.findIndex((p) => p.startMs + p.ms > ms);
+  if (from < 0) { toast(meta.length ? 'No audio at that moment.' : 'The audio for this meeting was deleted.'); return; }
+  const take = [];
+  for (const p of meta.slice(from)) {
+    take.push(await getPiece(p.key));
+    if (take.reduce((a, x) => a + x.ms, 0) > 600000) break; // about ten minutes
+  }
   const skip = Math.max(0, Math.floor(((ms - take[0].startMs) / 1000) * SAMPLE_RATE) - SAMPLE_RATE * 2);
   const total = take.reduce((n, p) => n + p.data.length, 0) - skip;
   const pcm = new Int16Array(total);
@@ -789,12 +1063,15 @@ function renderTimeline(m) {
   // lines typed before the recording started have no time and come first
   items.sort((a, b) => (a.t ?? -1) - (b.t ?? -1));
   const pane = $('#pane-timeline');
+  const tools = m.chunks && rec.meeting !== m.id
+    ? `<div class="pane-actions tl-tools"><button class="btn" id="retxBtn" title="Repair the saved audio and transcribe it again">${m.fix ? 'Finishing Re-transcribe' : 'Re-transcribe'}</button><button class="btn" id="dlBtn" title="Save this meeting's audio as one WAV file">Download audio</button></div>`
+    : '';
   if (!items.length) {
-    pane.innerHTML = `<p class="hint">Hit Record and type in the notepad. Your lines show here in bold on the meeting's clock, with the transcript between them. Tap any line to hear that moment.</p>`;
+    pane.innerHTML = tools + `<p class="hint">Hit Record and type in the notepad. Your lines show here in bold on the meeting's clock, with the transcript between them. Tap any line to hear that moment.</p>`;
     return;
   }
   const live = rec.interim && rec.meeting === m.id ? `<li><time>${clock(elapsed())}</time><span class="live">${esc(rec.interim)}</span></li>` : '';
-  pane.innerHTML = `<ul class="tl">${items.map((x) => `<li class="${x.t != null ? 'can' : ''}" data-t="${x.t ?? ''}"><time>${clock(x.t)}</time><span class="${x.kind}">${x.img ? `<img src="${x.img}" alt="Handwritten note">` : esc(x.text)}</span></li>`).join('')}${live}</ul>`;
+  pane.innerHTML = tools + `<ul class="tl">${items.map((x) => `<li class="${x.t != null ? 'can' : ''}" data-t="${x.t ?? ''}"><time>${clock(x.t)}</time><span class="${x.kind}">${x.img ? `<img src="${x.img}" alt="Handwritten note">` : esc(x.text)}</span></li>`).join('')}${live}</ul>`;
 }
 
 // A handwritten note as a small picture for the transcript, drawn once per version of the note.
@@ -891,7 +1168,7 @@ Rules:
 - The transcript is machine-made and mishears names. If a word in it is plainly a mishearing of one of the EXPECTED NAMES, write the expected name. Correct nothing else.
 - Never use em dashes or semicolons.`;
 
-async function claude(messages, { system, onText, maxTokens = 4000 } = {}) {
+async function claude(messages, { system, onText, maxTokens = 4000, info = {} } = {}) {
   if (!settings.anthropicKey) throw new Error('Add an Anthropic API key in Settings.');
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -922,6 +1199,7 @@ async function claude(messages, { system, onText, maxTokens = 4000 } = {}) {
       if (!line) continue;
       const d = JSON.parse(line.slice(6));
       if (d.type === 'content_block_delta' && d.delta?.type === 'text_delta') { out += d.delta.text; onText?.(out); }
+      if (d.type === 'message_delta' && d.delta?.stop_reason) info.stop = d.delta.stop_reason;
       if (d.type === 'error') throw new Error('Claude said: ' + d.error?.message);
     }
   }
@@ -978,6 +1256,16 @@ async function enhance() {
   const m = state.cur;
   if (!m) return;
   if (!m.lines.some((l) => l.text.trim()) && !m.ink?.length && !m.transcript.length && !m.captions.length) { toast('Write some notes or record first.'); return; }
+  if (m.fix) { toast('Re-transcribe is still repairing this meeting. Enhance once it has finished.', 5000); return; }
+  // about two hours of real talk is 110,000 characters. Far more than that is not a meeting, it is
+  // a transcript gone wrong (the 2026-11-16 one was 470,000 characters of loops), and sending it
+  // would cost a great deal and come back empty.
+  const chars = transcriptText(m).length;
+  if (chars > ENHANCE_MAX_CHARS) {
+    status(`The transcript is ${Math.round(chars / 1000)}k characters, too long to be real speech. Nothing was sent to Claude. Open the Transcript tab and tap Re-transcribe.`, true);
+    toast('The transcript looks broken. Re-transcribe it first.', 6000);
+    return;
+  }
   if (work.queue.some((j) => j.meeting === m.id) || work.busy?.meeting === m.id) toast('The transcript is still finishing. Enhancing with what is done so far.');
   state.view = 'notes';
   renderPane();
@@ -989,10 +1277,16 @@ async function enhance() {
   live.className = 'md';
   pane.appendChild(live);
   try {
+    const info = {};
     const out = await claude([{ role: 'user', content: withInk(m, meetingContext(m)) }], {
       system: 'You write meeting records for Matt Knowles, a financial analyst at True North Companies. ' + NOTE_FORMAT,
       onText: (t) => { live.innerHTML = md(t); },
+      maxTokens: 8000,
+      info,
     });
+    // an empty answer is a failure, never a write-up: the old record (if any) stays as it was
+    if (!out.trim()) throw new Error('Claude sent back an empty write-up, so nothing was saved. Try Enhance again.');
+    if (info.stop === 'max_tokens') toast('The write-up hit its length limit and may end early.', 5000);
     m.enhanced = { md: out, model: settings.model, at: Date.now() };
     if (!m.title) { const h = out.match(/^# (.+)$/m); if (h) { m.title = h[1].replace(/\[\[|\]\]/g, '').trim(); $('#title').value = m.title; } }
     touch(m);
@@ -1001,8 +1295,9 @@ async function enhance() {
   } catch (err) {
     live.remove();
     btn.disabled = false;
-    btn.textContent = 'Enhance notes';
-    toast(err.message, 5000);
+    btn.textContent = m.enhanced ? 'Enhance again' : 'Enhance notes';
+    status(err.message, true);
+    toast(err.message, 6000);
   }
 }
 
@@ -1103,7 +1398,7 @@ async function sync(m, quiet = true) {
   }
   const inkFile = await syncInk(m, repo, branch, path);
   const existing = await gh(`/repos/${repo}/contents/${path}?ref=${branch}`);
-  const { _chunkEnd, ...doc } = m;
+  const { _chunkEnd, fix, ...doc } = m;
   const body = JSON.stringify({ schema: 1, ...doc, inkImage: inkFile.inkPath || null, companyName: COMPANIES.find((c) => c[0] === m.company)?.[1] || '' }, null, 2) + '\n';
   const at = Date.now();
   const r = await gh(`/repos/${repo}/contents/${path}`, {
@@ -1274,6 +1569,9 @@ function bind() {
   drawer(innerWidth > 1100 && saved !== '0');
   $('#drawerBtn').onclick = () => drawer($('#stage').classList.contains('closed'));
   $('#pane-timeline').onclick = (e) => {
+    const id = e.target.closest('button')?.id;
+    if (id === 'retxBtn') { retranscribe(state.cur); return; }
+    if (id === 'dlBtn') { downloadAudio(state.cur); return; }
     const li = e.target.closest('li.can');
     if (li && li.dataset.t !== '') playFrom(state.cur, +li.dataset.t);
   };
@@ -1344,9 +1642,16 @@ async function boot() {
   state.meetings = await getAll('meetings');
   // a recording cut off by a crash or a closed tab: its pieces are saved, the clock is not
   for (const m of state.meetings) {
-    const pieces = await audioFor(m.id);
+    let dirty = false;
+    // an Enhance that came back empty is no write-up at all
+    if (m.enhanced && !String(m.enhanced.md || '').trim()) { m.enhanced = null; dirty = true; }
+    const pieces = await pieceMeta(m.id);
     const end = pieces.reduce((n, p) => Math.max(n, p.startMs + p.ms), 0);
-    if (end > m.durationMs) { m.durationMs = end; await put('meetings', m); }
+    // Pieces saved before the 16 kHz fix are labelled about three times too long, so they never
+    // stretch the clock: the duration they would overwrite is what tells Re-transcribe the true rate.
+    const legacy = pieces.some((p) => !p.rate);
+    if (end > m.durationMs && !legacy && !m.fix) { m.durationMs = end; dirty = true; }
+    if (dirty) await put('meetings', m);
   }
   for (const m of [...state.meetings]) await dropIfEmpty(m);
   renderList();
@@ -1355,7 +1660,7 @@ async function boot() {
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
   if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   syncAll();
-  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance, isEmpty, removeCurrent, render: () => { renderList(); renderPane(); }, open, ink: () => ink, groups, inkContent };
+  window.__notes = { state, rec, work, settings: () => settings, saveSettings, restamp, md, slug, sync, enhance, isEmpty, removeCurrent, render: () => { renderList(); renderPane(); }, open, ink: () => ink, groups, inkContent, retranscribe, downloadAudio, pieceMeta, getPiece, put, suggestRatio };
 }
 
 boot();

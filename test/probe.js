@@ -104,6 +104,7 @@ function sse(text) {
 
   // let two 30-second pieces land, then stop
   await page.waitForTimeout(46000);
+  check('the clock check leaves an honest microphone alone', await page.evaluate(() => window.__notes.rec.clock.checked && !window.__notes.rec.clock.fixed));
   await page.click('#recBtn');
   await page.waitForFunction(() => !window.__notes.rec.meeting);
   const stamps = await page.evaluate(() => window.__notes.state.cur.lines.map((l) => [l.text, l.t]));
