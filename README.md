@@ -39,7 +39,19 @@ the backup. Say a meeting is being recorded.
   audio never leaves the iPad. Safari's live captions are an optional extra.
 - **Transcript tab**: your lines in bold among the transcript on one clock. Tap a line to hear
   that moment.
-- **Enhance**: Claude writes summary, decisions, action items with owners, filled-out notes and
+- **Re-transcribe** (Transcript tab): repairs a meeting's saved audio and hears it again. Meetings
+  recorded before 2026-11-16's fix saved 48 kHz audio labelled 16 kHz (the iPad agreed to a 16 kHz
+  context and kept feeding 48 kHz), so Whisper heard speech at a third of its speed and looped. It
+  finds the true rate from the recorded length, the synced copy, or the sound of the voices, asks
+  you to confirm the meeting's length, resamples every piece, and transcribes them again. It picks
+  up where it left off if the app closes part way.
+- **Download audio** (Transcript tab): the whole meeting as one 16 kHz WAV, at its true speed, to
+  save to Files. Audio still never syncs.
+- **The clock check**: while recording, the samples are counted against the wall clock. If a
+  device says one rate and sends another, the worklet is corrected at once and the status line says so.
+- **Loop filter**: a Whisper segment that is mostly one phrase said over and over ("I see, I see")
+  is cut to one saying, or dropped if that was all it was.
+- **Enhance** (refuses a transcript too long to be real speech, and never saves an empty answer): Claude writes summary, decisions, action items with owners, filled-out notes and
   quotes, your own words dark and Claude's grey. Seven meeting types steer it, and a list of
   expected names fixes transcript mishearings.
 - **Ask** about one meeting, or start with `all:` to ask across all of them.
@@ -62,6 +74,7 @@ the backup. Say a meeting is being recorded.
 | `ink.js` | The Pencil: input, drawing, the eraser, handwritten notes, pictures for Claude |
 | `whisper-worker.js` | Whisper in its own thread (transformers.js 3.8.1 from jsDelivr) |
 | `pcm-worklet.js` | The microphone at 16 kHz, one second per message |
+| `audio-fix.js` | Resampling, the slowed-speech test, the loop filter and the repair plan |
 | `sw.js`, `manifest.webmanifest`, icons | Home-screen install and offline start |
 | `docs/TEARDOWN.md` | Granola, Fireflies and Goodnotes taken apart, and the phases |
 | `test/` | The end-to-end probe, the Pencil probe and the seam unit test |
@@ -75,10 +88,14 @@ OUT=/tmp/notes-test node test/probe.js
 OUT=/tmp/notes-test node test/ink-probe.js
 node test/list-probe.js
 node test/trim.mjs
+OUT=/tmp/notes-test node test/audio-fix.mjs
+OUT=/tmp/notes-test node test/rate-probe.js
 ```
 
 The probe drives headless Chromium with a fake microphone playing a natural-voice meeting, the
-real Whisper model, and Claude and GitHub mocked: 26 of 26 on 2026-10-26. Test with a natural
+real Whisper model, and Claude and GitHub mocked: 27 of 27 on 2026-11-16. The rate probe makes
+the context claim 16 kHz while the microphone runs faster (the iPad's lie) and repairs a meeting
+saved at 3x: 24 of 24. The audio-fix unit cases: 10 of 10. Test with a natural
 voice: Whisper skips robot speech (espeak). The Pencil probe sends real pen events (Chrome's
 DevTools protocol reports them as `pointerType: "pen"`, as Safari does for the Pencil): 23 of 23.
 What only an iPad can prove: palm rejection, that a Pencil touch on the notepad does not start

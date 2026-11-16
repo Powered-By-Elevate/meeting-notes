@@ -1,6 +1,7 @@
 // Whisper on the device, in its own thread so typing never stalls.
 // The model downloads once from Hugging Face and the library keeps it in the browser's cache.
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+import { cleanSegment } from './audio-fix.js';
 
 env.allowLocalModels = false;
 
@@ -45,21 +46,30 @@ self.onmessage = async (e) => {
     } else if (m.type === 'run') {
       await load(m.model);
       const secs = m.audio.length / 16000;
-      const keep = (cs) => cs
-        .filter((c) => c.text && !NOISE.test(c.text))
-        .map((c) => ({
-          t0: Math.round(m.offsetMs + 1000 * (c.timestamp?.[0] ?? 0)),
-          t1: Math.round(m.offsetMs + 1000 * (c.timestamp?.[1] ?? secs)),
-          text: c.text.trim(),
-        }));
+      // a segment that is mostly one word or phrase said over and over is Whisper looping, not
+      // speech: the repeats are cut, and a segment that was nothing but the loop is dropped
+      const keep = async (cs) => {
+        const out = [];
+        for (const c of cs) {
+          if (!c.text || NOISE.test(c.text)) continue;
+          const text = await cleanSegment(c.text);
+          if (!text || NOISE.test(text)) continue;
+          out.push({
+            t0: Math.round(m.offsetMs + 1000 * (c.timestamp?.[0] ?? 0)),
+            t1: Math.round(m.offsetMs + 1000 * (c.timestamp?.[1] ?? secs)),
+            text,
+          });
+        }
+        return out;
+      };
       // one window of at most 30 seconds: no long-form chunking, which lost text in testing
       const out = await asr(m.audio, { return_timestamps: true });
-      let segments = keep(out.chunks || []);
+      let segments = await keep(out.chunks || []);
       if (!segments.length && m.loud) {
         // Whisper sometimes stops at once when asked for timestamps. A piece with real sound in it
         // gets a second try without them, as one segment spanning the piece.
         const plain = await asr(m.audio, {});
-        segments = keep([{ text: plain.text, timestamp: [0, secs] }]);
+        segments = await keep([{ text: plain.text, timestamp: [0, secs] }]);
       }
       self.postMessage({ type: 'result', id: m.id, segments });
     }

@@ -1,5 +1,7 @@
 // Turns the microphone into 16 kHz mono 16-bit samples, one second per message.
-// Whisper wants 16 kHz. When the AudioContext already runs at 16 kHz the ratio is 1.
+// Whisper wants 16 kHz. The context runs at the device's own rate and this resamples from the
+// rate it reports. An iPad has been measured reporting 16 kHz while feeding 48 kHz, so the app
+// also checks the samples against the clock and sends a corrected ratio here when they disagree.
 class PcmCapture extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -7,6 +9,16 @@ class PcmCapture extends AudioWorkletProcessor {
     this.t = 0;
     this.buf = new Int16Array(16000);
     this.n = 0;
+    this.port.onmessage = (e) => {
+      if (!(e.data && e.data.ratio > 0)) return;
+      // what was gathered at the old ratio goes first, then the ack, so the app knows exactly
+      // which samples came before the change
+      if (this.n) this.port.postMessage(this.buf.slice(0, this.n));
+      this.buf = new Int16Array(16000);
+      this.n = 0;
+      this.ratio = e.data.ratio;
+      this.port.postMessage({ ack: this.ratio });
+    };
   }
 
   process(inputs) {
